@@ -31,6 +31,7 @@ from optimizer import (
 
 from data_utils import FT_Dataset
 from model import GPT2Config, GPT2LMModel
+from model_top_down import GPT2LMModel_Top_Down
 from exp_utils import create_exp_dir
 
 import loralib as lora
@@ -89,6 +90,10 @@ parser.add_argument('--roll_lr', type=float, default=0.00001, help='rolling lear
 parser.add_argument('--roll_step', type=int, default=100, help='rolling step')
 
 parser.add_argument('--eval_epoch', type=int, default=1, help='eval per number of epochs')
+
+parser.add_argument('--top_down_model', action='store_true', default=False)
+
+parser.add_argument('--freeze_ff_backbone', action='store_true', default=False)
 
 # influence model, calculate the influence score between two samples.
 def print_args(args):
@@ -318,7 +323,11 @@ if __name__ == '__main__':
             lora_dropout=args.lora_dropout,
         )
 
-    lm_net = GPT2LMModel(config)
+    if args.top_down_model:
+        lm_net = GPT2LMModel_Top_Down(config)
+    else:
+        lm_net = GPT2LMModel(config)
+
     if args.init_checkpoint is not None:
         print('loading model pretrained weight.')
         lm_net.load_weight(torch.load(args.init_checkpoint))    
@@ -327,6 +336,12 @@ if __name__ == '__main__':
 
     if args.lora_dim > 0:
         lora.mark_only_lora_as_trainable(lm_net)
+    if args.freeze_ff_backbone:
+        for k, v in lm_net.transformer.named_parameters():
+            if 'decoder' not in k and 'prompt' not in k:
+            # if 'top_down_transform' not in k and 'prompt' not in k:
+                v.requires_grad = False
+
     optimizer = create_adam_optimizer_from_args(lm_net, args)
 
     if args.max_step is None:

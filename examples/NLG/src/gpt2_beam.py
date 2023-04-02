@@ -33,6 +33,7 @@ from exp_utils import create_exp_dir
 
 from data_utils import FT_Dataset 
 from model import GPT2Config, GPT2LMModel
+from model_top_down import GPT2LMModel_Top_Down
 
 
 parser = argparse.ArgumentParser(description='PyTorch GPT2 beam decoding')
@@ -80,6 +81,7 @@ parser.add_argument('--eos_token_id', action='append', type=int, default=[50256]
 parser.add_argument('--output_file', type=str, default='beam_prediction.jsonl', 
                     help='output file name')
 
+parser.add_argument('--top_down_model', action='store_true', default=False)
 
 def print_args(args):
     if args.rank == 0:
@@ -253,14 +255,14 @@ def beam(model, data_iter, args):
             with torch.no_grad():
                 for i in range(0, args.eval_len):
                     if i == 0:
-                        logits, past = model(_query) 
+                        logits, ff_past, past = model(_query)
                         logits = logits[_bbatch, (_query_len-1).long(), :] # batch_size * beam, vocab
                     else:
                         #print('token_id.shape', token_id.shape, token_id)
                         #print('past.shape', past[0].shape)
                         #print('len_past.shape', len_past.shape, len_past)
                         
-                        logits, past = model(token_id, past=past, len_past=len_past) 
+                        logits, ff_past, past = model(token_id, ff_past=ff_past, past=past, len_past=len_past)
                         logits = logits[:, -1, :]    # batch_size * beam, vocab
 
                     logits = _postprocess_next_token_scores(           
@@ -297,6 +299,7 @@ def beam(model, data_iter, args):
                     token_id = (next_tokens % vocab_size).view(-1).unsqueeze(-1) # batch_size, num_beams
 
                     beam_idx = beam_id.view(batch_size, num_beams) + (_batch * num_beams).unsqueeze(-1)
+                    ff_past = _reorder_cache(ff_past, beam_idx.view(-1))
                     past = _reorder_cache(past, beam_idx.view(-1))                
                     beam_scores = next_scores # batch_size, num_beams
                     len_past = (_query_len + i).long()
@@ -378,7 +381,10 @@ if __name__ == '__main__':
             lora_attn_dim=args.lora_dim, lora_attn_alpha=args.lora_alpha,
         )
 
-    lm_net = GPT2LMModel(config)
+    if args.top_down_model:
+        lm_net = GPT2LMModel_Top_Down(config)
+    else:
+        lm_net = GPT2LMModel(config)
     if args.init_checkpoint is not None:
         print('loading model pretrained weight.')
         cp = torch.load(args.init_checkpoint, map_location=torch.device('cpu'))

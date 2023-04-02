@@ -138,11 +138,18 @@ class Attention(nn.Module):
         else:
             return x.permute(0, 2, 1, 3).contiguous()  # (batch, head, seq_length, head_features)
 
-    def forward(self, x, history=None, layer_past=None, len_past=None):
+    def forward(self, x, history=None, layer_past=None, len_past=None, td=None):
         hidden_states = x
 
         x = self.c_attn(x)
         query, key, value = x.split(self.split_size, dim=2)
+
+        if td is not None:
+            td_qkv = self.c_attn(hidden_states + td)
+            _, __, value = td_qkv.split(self.split_size, dim=2)
+            # td_qkv = self.c_attn(td)
+            # _, __, td_value = td_qkv.split(self.split_size, dim=2)
+            # value = value + td_value
 
         query = self.split_heads(query)
         key = self.split_heads(key, k=True)
@@ -206,12 +213,24 @@ class Block(nn.Module):
         self.ln_2 = LayerNorm(nx, eps=config.layer_norm_epsilon)
         self.mlp = MLP(4 * nx, config)
 
-    def forward(self, x, layer_past=None, len_past=None):
-        a, present = self.attn(self.ln_1(x), layer_past=layer_past, len_past=len_past)
+    def forward(self, x, layer_past=None, len_past=None, td=None):
+        a, present = self.attn(self.ln_1(x), layer_past=layer_past, len_past=len_past, td=td)
         x = x + a
         m = self.mlp(self.ln_2(x))
         x = x + m
         return x, present
+
+
+class Decode_Block(nn.Module):
+    def __init__(self, inplanes):
+        super().__init__()
+        self.linear = nn.Linear(inplanes, inplanes, bias=False)
+        self.linear2 = nn.Linear(inplanes, inplanes, bias=False)
+
+    def forward(self, x):
+        x = self.linear(x)
+        out = self.linear2(x)
+        return x, out
 
 
 class GPT2Model(nn.Module):
@@ -227,19 +246,31 @@ class GPT2Model(nn.Module):
         self.h = nn.ModuleList([copy.deepcopy(block) for _ in range(config.n_layer)])
         self.ln_f = LayerNorm(config.n_embd, eps=config.layer_norm_epsilon)
 
+        self.decoders = nn.ModuleList([Decode_Block(config.n_embd) for _ in range(config.n_layer)])
+        self.prompt = torch.nn.parameter.Parameter(torch.randn(config.n_embd), requires_grad=True)
+        self.top_down_transform = torch.nn.parameter.Parameter(torch.eye(config.n_embd), requires_grad=True)
+
         self.config = config
 
+    def feedback(self, x):
+        td = []
+        for depth in range(len(self.decoders) - 1, -1, -1):
+            x, out = self.decoders[depth](x)
+            td = [out] + td
+        return td
 
     def forward(
         self, 
         input_ids, 
         position_ids=None, 
-        token_type_ids=None, 
+        token_type_ids=None,
+        ff_past=None,
         past=None, 
         len_past=None
     ):
         if past is None:
             past_length = 0
+            ff_past = [None] * len(self.h)
             past = [None] * len(self.h)
         elif len_past is None:
             # equal size for past. []
@@ -268,13 +299,30 @@ class GPT2Model(nn.Module):
         else:
             token_type_embeds = 0
         hidden_states = inputs_embeds + position_embeds + token_type_embeds
+        ff_presents = []
         presents = []
-        for block, layer_past in zip(self.h, past):
-            hidden_states, present = block(hidden_states, layer_past = layer_past, len_past=len_past)
+
+        # first feedforward
+        input = hidden_states
+        for i, (block, layer_past) in enumerate(zip(self.h, ff_past)):
+            hidden_states, ff_present = block(hidden_states, layer_past = layer_past, len_past=len_past)
+            ff_presents.append(ff_present)
+
+        # feedback
+        cos_sim = F.normalize(hidden_states, dim=-1) @ F.normalize(self.prompt[None, ..., None], dim=1)  # B, N, 1
+        mask = cos_sim.clamp(0, 1)
+        hidden_states = hidden_states * mask
+        hidden_states = hidden_states @ self.top_down_transform
+        td = self.feedback(hidden_states)
+
+        # second feedforward
+        hidden_states = input
+        for i, (block, layer_past) in enumerate(zip(self.h, past)):
+            hidden_states, present = block(hidden_states, layer_past = layer_past, len_past=len_past, td=td[i])
             presents.append(present)
         hidden_states = self.ln_f(hidden_states)
         output_shape = input_shape + (hidden_states.size(-1),)
-        return hidden_states.view(*output_shape), presents
+        return hidden_states.view(*output_shape), ff_presents, presents
 
 
 class GPT2LMHead(nn.Module):
@@ -328,9 +376,9 @@ class GPT2Config(object):
         self.fix_dropout = fix_dropout
 
 
-class GPT2LMModel(nn.Module):
+class GPT2LMModel_Top_Down(nn.Module):
     def __init__(self, config):
-        super(GPT2LMModel, self).__init__()
+        super(GPT2LMModel_Top_Down, self).__init__()
         self.transformer = GPT2Model(config)
         self.lm_head = GPT2LMHead(self.transformer.wte.weight, config)
         self.apply(self._init_weights)
@@ -351,7 +399,7 @@ class GPT2LMModel(nn.Module):
         is_report_accuracy=False
     ):
         _batch, _len = input_ids.shape
-        hidden_states, presents = self.transformer(input_ids, past=past, len_past=len_past)
+        hidden_states, ff_presents, presents = self.transformer(input_ids, ff_past=ff_past, past=past, len_past=len_past)
 
         # batch, seq, vocab
         lm_logits = self.lm_head(hidden_states)
@@ -406,7 +454,7 @@ class GPT2LMModel(nn.Module):
                 return lm_logits, loss, _t1_acc, _all_acc
             else:
                 return lm_logits, loss
-        return lm_logits, presents, presents
+        return lm_logits, ff_presents, presents
            
     def _init_weights(self, module):
         if isinstance(module, (nn.Linear, nn.Embedding)):
@@ -436,6 +484,9 @@ class GPT2LMModel(nn.Module):
             if key.startswith("module.transformer."):
                 new_key = key[len("module.transformer."):]
 
+            if key.startswith("transformer."):
+                new_key = key[len("transformer."):]
+
             if new_key:
                 old_keys.append(key)
                 new_keys.append(new_key)
@@ -443,9 +494,9 @@ class GPT2LMModel(nn.Module):
         for old_key, new_key in zip(old_keys, new_keys):
             state_dict[new_key] = state_dict.pop(old_key)
         
-        for n, p in self.transformer.named_parameters():
-            if n not in state_dict:
-                state_dict[n] = p
+        # for n, p in self.transformer.named_parameters():
+        #     if n not in state_dict:
+        #         state_dict[n] = p
 
         self.transformer.load_state_dict(state_dict, strict=False)
         self.set_tied()
